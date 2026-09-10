@@ -356,54 +356,9 @@ fn first_frame_if_gif(image_path: &Path, tmp_dir: &Path) -> PathBuf {
 // Stage 1: Primary classification
 // ---------------------------------------------------------------------------
 
-fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Value {
-    let effective_path = first_frame_if_gif(image_path, tmp_dir);
-
-    // Attempt 1: primary prompt with json_mode
-    let resp1 = ollama_generate(model, PRIMARY_PROMPT, Some(&effective_path), 500, 180, true);
-    if resp1.ok {
-        if let Some(v) = parse_json_response(&resp1.raw) {
-            if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return v;
-            }
-        }
-    }
-
-    // Attempt 2: primary prompt without json_mode
-    let prompt2 = format!("{PRIMARY_PROMPT} Return a single JSON object only.");
-    let resp2 = ollama_generate(model, &prompt2, Some(&effective_path), 500, 180, false);
-    if resp2.ok {
-        if let Some(v) = parse_json_response(&resp2.raw) {
-            if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return v;
-            }
-        }
-    }
-
-    // Attempt 3: fallback prompt with json_mode
-    let resp3 = ollama_generate(
-        model,
-        PRIMARY_PROMPT_FALLBACK,
-        Some(&effective_path),
-        260,
-        180,
-        true,
-    );
-    if resp3.ok {
-        if let Some(v) = parse_json_response(&resp3.raw) {
-            if v.get("media_type").and_then(|v| v.as_str()).is_some() {
-                return v;
-            }
-        }
-    }
-
-    // Salvage from raw attempts
-    let combined = format!("{}\n{}\n{}", resp1.raw, resp2.raw, resp3.raw);
-    if let Some(v) = salvage_primary_from_raw(&combined) {
-        return v;
-    }
-
-    // Safe default
+/// Fallback used when primary classification fails completely. Confidence 0.0
+/// keeps the file in `list_unclassified_files`, so it is retried next scan.
+fn default_primary() -> Value {
     serde_json::json!({
         "media_type": "other",
         "contains_text": false,
@@ -416,6 +371,76 @@ fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Value {
     })
 }
 
+/// Confidence stored for a *successful* classification.
+///
+/// `confidence = 0.0` in the DB means "not classified yet" (see
+/// `db::list_unclassified_files`), but the model often echoes the `0.0` from
+/// the prompt schema even when it clearly identified the image. Flooring
+/// successful results keeps them from being reclassified on every scan.
+pub const MIN_CLASSIFIED_CONFIDENCE: f32 = 0.01;
+
+pub fn classified_confidence(raw: Option<f64>) -> f32 {
+    let c = raw.unwrap_or(0.0) as f32;
+    if c.is_finite() && c > 0.0 {
+        c.min(1.0)
+    } else {
+        MIN_CLASSIFIED_CONFIDENCE
+    }
+}
+
+fn primary_from_response(resp: &crate::llm::client::OllamaResponse) -> Option<Value> {
+    if !resp.ok {
+        return None;
+    }
+    parse_json_response(&resp.raw)
+        .filter(|v| v.get("media_type").and_then(|v| v.as_str()).is_some())
+}
+
+/// Primary classification. Returns `None` when every attempt failed.
+fn classify_primary(model: &str, image_path: &Path, tmp_dir: &Path) -> Option<Value> {
+    let effective_path = first_frame_if_gif(image_path, tmp_dir);
+
+    // Attempt 1: primary prompt with json_mode
+    let resp1 = ollama_generate(model, PRIMARY_PROMPT, Some(&effective_path), 500, 180, true);
+    if let Some(v) = primary_from_response(&resp1) {
+        return Some(v);
+    }
+    // HTTP 4xx (e.g. context overflow, model missing): the same image would
+    // fail again on attempts 2 and 3, so don't waste two more calls.
+    if resp1.is_client_error() {
+        log::warn!(
+            "Primary classification rejected for {}: {}",
+            image_path.display(),
+            resp1.raw
+        );
+        return None;
+    }
+
+    // Attempt 2: primary prompt without json_mode
+    let prompt2 = format!("{PRIMARY_PROMPT} Return a single JSON object only.");
+    let resp2 = ollama_generate(model, &prompt2, Some(&effective_path), 500, 180, false);
+    if let Some(v) = primary_from_response(&resp2) {
+        return Some(v);
+    }
+
+    // Attempt 3: fallback prompt with json_mode
+    let resp3 = ollama_generate(
+        model,
+        PRIMARY_PROMPT_FALLBACK,
+        Some(&effective_path),
+        260,
+        180,
+        true,
+    );
+    if let Some(v) = primary_from_response(&resp3) {
+        return Some(v);
+    }
+
+    // Salvage from raw attempts
+    let combined = format!("{}\n{}\n{}", resp1.raw, resp2.raw, resp3.raw);
+    salvage_primary_from_raw(&combined)
+}
+
 // ---------------------------------------------------------------------------
 // Stage 2a: Anime enrichment
 // ---------------------------------------------------------------------------
@@ -424,6 +449,9 @@ fn classify_anime_details(model: &str, image_path: &Path, tmp_dir: &Path) -> Opt
     let effective_path = first_frame_if_gif(image_path, tmp_dir);
 
     let resp = ollama_generate(model, ANIME_PROMPT, Some(&effective_path), 600, 180, true);
+    if resp.is_client_error() {
+        return None;
+    }
     if resp.ok {
         if let Some(v) = parse_json_response(&resp.raw) {
             let conf = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
@@ -654,7 +682,9 @@ pub fn classify_image(
     surya_script: &Path,
 ) -> ClassificationResult {
     log::info!("Classifying: {}", image_path.display());
-    let primary = classify_primary(model, image_path, tmp_dir);
+    let classified = classify_primary(model, image_path, tmp_dir);
+    let succeeded = classified.is_some();
+    let primary = classified.unwrap_or_else(default_primary);
 
     let media_type = primary
         .get("media_type")
@@ -666,10 +696,11 @@ pub fn classify_image(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let confidence = primary
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0) as f32;
+    let confidence = if succeeded {
+        classified_confidence(primary.get("confidence").and_then(|v| v.as_f64()))
+    } else {
+        0.0
+    };
 
     let mut full_description = description.clone();
     let mut extracted_text = String::new();
@@ -1013,8 +1044,7 @@ pub fn classify_pdf(
                 log::warn!("Failed to save PDF page for classification: {e}");
                 None
             } else {
-                let result = classify_primary(model, &tmp_img_path, tmp_dir);
-                Some(result)
+                classify_primary(model, &tmp_img_path, tmp_dir)
             }
         }
         Err(e) => {
@@ -1295,6 +1325,27 @@ mod tests {
     #[test]
     fn detect_lang_hint_japanese() {
         assert_eq!(detect_lang_hint("日本語のテキスト"), "ja");
+    }
+
+    #[test]
+    fn classified_confidence_floors_zero_and_missing() {
+        assert_eq!(classified_confidence(Some(0.0)), MIN_CLASSIFIED_CONFIDENCE);
+        assert_eq!(classified_confidence(None), MIN_CLASSIFIED_CONFIDENCE);
+        assert_eq!(classified_confidence(Some(-0.5)), MIN_CLASSIFIED_CONFIDENCE);
+        assert!(classified_confidence(Some(0.0)) > 0.0);
+    }
+
+    #[test]
+    fn classified_confidence_keeps_and_clamps_model_value() {
+        assert!((classified_confidence(Some(0.95)) - 0.95).abs() < 1e-6);
+        assert_eq!(classified_confidence(Some(7.0)), 1.0);
+    }
+
+    #[test]
+    fn default_primary_is_unclassified() {
+        let d = default_primary();
+        assert_eq!(d["media_type"], "other");
+        assert_eq!(d["confidence"], 0.0);
     }
 
     #[test]
