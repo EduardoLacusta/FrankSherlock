@@ -8,6 +8,29 @@ use serde_json::Value;
 use crate::llm::{ollama_generate, parse_json_response};
 use crate::models::ClassificationResult;
 
+/// Hard limit for one Surya OCR run. The helper process is killed when it
+/// expires and OCR falls back to the vision model. Without a limit a stuck
+/// helper blocks the scan thread forever (no error, no progress).
+const SURYA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// OCR text shorter than this is not worth a document-field extraction call:
+/// a logo or a serial number has no issuer, date or amount to find.
+const MIN_OCR_CHARS_FOR_DOC_FIELDS: usize = 40;
+
+/// Truncate `text` to at most `max_bytes`, never splitting a character.
+/// Plain `&text[..n]` panics on a multi-byte boundary, which killed the scan
+/// thread silently (accented text is common in PT/JA documents).
+pub fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 // ---------------------------------------------------------------------------
 // Prompts (identical to Python prototype)
 // ---------------------------------------------------------------------------
@@ -488,10 +511,38 @@ fn run_surya_ocr(image_path: &Path, surya_venv: &Path, surya_script: &Path) -> O
         return OcrResult::failed("surya");
     }
 
-    let result = silent_command(&python_bin)
-        .arg(surya_script)
-        .arg(image_path)
-        .output();
+    let mut cmd = silent_command(&python_bin);
+    cmd.arg(surya_script).arg(image_path);
+    let result = crate::platform::process::run_with_timeout(&mut cmd, SURYA_TIMEOUT);
+
+    let result: std::io::Result<std::process::Output> = match result {
+        Ok(Some(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::warn!(
+                    "Surya OCR failed for {}: {}",
+                    image_path.display(),
+                    stderr.trim()
+                );
+            }
+            Ok(output)
+        }
+        Ok(None) => {
+            log::warn!(
+                "Surya OCR timed out after {}s for {} - process killed, falling back",
+                SURYA_TIMEOUT.as_secs(),
+                image_path.display()
+            );
+            return OcrResult::failed("surya_timeout");
+        }
+        Err(e) => {
+            log::warn!(
+                "Surya OCR could not start for {}: {e}",
+                image_path.display()
+            );
+            return OcrResult::failed("surya");
+        }
+    };
 
     match result {
         Ok(output) if output.status.success() => {
@@ -535,7 +586,6 @@ fn run_llm_ocr(model: &str, image_path: &Path, tmp_dir: &Path) -> OcrResult {
 
 struct OcrResult {
     ok: bool,
-    #[allow(dead_code)]
     engine: String,
     text: String,
     #[allow(dead_code)]
@@ -682,7 +732,12 @@ pub fn classify_image(
     surya_script: &Path,
 ) -> ClassificationResult {
     log::info!("Classifying: {}", image_path.display());
+    let started = std::time::Instant::now();
+    let mut t_anime = 0.0f32;
+    let mut t_ocr = 0.0f32;
+    let mut t_doc = 0.0f32;
     let classified = classify_primary(model, image_path, tmp_dir);
+    let t_primary = started.elapsed().as_secs_f32();
     let succeeded = classified.is_some();
     let primary = classified.unwrap_or_else(default_primary);
 
@@ -708,7 +763,10 @@ pub fn classify_image(
 
     // Anime enrichment
     if should_run_anime_enrichment(&primary) {
-        if let Some(anime) = classify_anime_details(model, image_path, tmp_dir) {
+        let anime_started = std::time::Instant::now();
+        let anime_result = classify_anime_details(model, image_path, tmp_dir);
+        t_anime = anime_started.elapsed().as_secs_f32();
+        if let Some(anime) = anime_result {
             if let Some(series) = anime.get("series").and_then(clean_nullable_str) {
                 full_description = format!("{full_description} [Series: {series}]");
             }
@@ -748,22 +806,47 @@ pub fn classify_image(
     canonical_mentions = all_mentions.join(", ");
 
     // Document enrichment
+    let mut ocr_engine = "none".to_string();
     if should_run_document_enrichment(&primary) {
+        let ocr_started = std::time::Instant::now();
         let ocr = run_ocr(model, image_path, tmp_dir, surya_venv, surya_script);
+        t_ocr = ocr_started.elapsed().as_secs_f32();
+        ocr_engine = if ocr.ok {
+            ocr.engine.clone()
+        } else {
+            format!("{}_failed", ocr.engine)
+        };
         if ocr.ok && !ocr.text.is_empty() {
             extracted_text = ocr.text.clone();
 
-            let doc_fields = extract_document_fields(model, &ocr.text);
-            if let Some(kind) = doc_fields.get("document_kind").and_then(clean_nullable_str) {
-                full_description = format!("{full_description} [Doc: {kind}]");
-            }
-            if let Some(issuer) = doc_fields.get("issuer").and_then(clean_nullable_str) {
-                full_description = format!("{full_description} [Issuer: {issuer}]");
+            // A handful of characters (a logo, a serial) has no document
+            // fields worth a second LLM call.
+            if extracted_text.trim().chars().count() >= MIN_OCR_CHARS_FOR_DOC_FIELDS {
+                let doc_started = std::time::Instant::now();
+                let doc_fields = extract_document_fields(model, &ocr.text);
+                t_doc = doc_started.elapsed().as_secs_f32();
+                if let Some(kind) = doc_fields.get("document_kind").and_then(clean_nullable_str) {
+                    full_description = format!("{full_description} [Doc: {kind}]");
+                }
+                if let Some(issuer) = doc_fields.get("issuer").and_then(clean_nullable_str) {
+                    full_description = format!("{full_description} [Issuer: {issuer}]");
+                }
             }
         }
     }
 
     let lang_hint = detect_lang_hint(&extracted_text);
+
+    log::info!(
+        "Classified {} in {:.1}s (primary {:.1}s, anime {:.1}s, ocr[{}] {:.1}s, doc {:.1}s)",
+        image_path.display(),
+        started.elapsed().as_secs_f32(),
+        t_primary,
+        t_anime,
+        ocr_engine,
+        t_ocr,
+        t_doc
+    );
 
     ClassificationResult {
         media_type,
@@ -961,7 +1044,7 @@ pub fn classify_video(
 
     // Cap subtitle text for extracted_text field
     let extracted_text = if subtitle_text.len() > 4000 {
-        subtitle_text[..4000].to_string()
+        truncate_on_char_boundary(&subtitle_text, 4000).to_string()
     } else {
         subtitle_text
     };
@@ -1127,7 +1210,7 @@ pub fn classify_pdf(
         // Text-rich PDF: use extracted text for LLM document field extraction
         extracted_text = full_text.clone();
         let context = if full_text.len() > 2000 {
-            &full_text[..2000]
+            truncate_on_char_boundary(&full_text, 2000)
         } else {
             &full_text
         };
@@ -1143,7 +1226,10 @@ pub fn classify_pdf(
         extracted_text = String::new();
         if tmp_img_path.exists() {
             let ocr = run_ocr(model, &tmp_img_path, tmp_dir, surya_venv, surya_script);
-            if ocr.ok && !ocr.text.is_empty() {
+            if ocr.ok
+                && !ocr.text.is_empty()
+                && ocr.text.trim().chars().count() >= MIN_OCR_CHARS_FOR_DOC_FIELDS
+            {
                 extracted_text = ocr.text.clone();
 
                 let doc_fields = extract_document_fields(model, &ocr.text);
@@ -1346,6 +1432,35 @@ mod tests {
         let d = default_primary();
         assert_eq!(d["media_type"], "other");
         assert_eq!(d["confidence"], 0.0);
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_short_text_untouched() {
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_ascii() {
+        assert_eq!(truncate_on_char_boundary("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_never_splits_multibyte() {
+        // "ção" - the cut lands inside the multi-byte 'ç'
+        let text = "relatório de manutenção";
+        for max in 1..text.len() {
+            let cut = truncate_on_char_boundary(text, max);
+            assert!(cut.len() <= max);
+            assert!(text.starts_with(cut));
+        }
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_emoji_and_cjk() {
+        let text = "領収書 2024 ✅";
+        for max in 1..text.len() {
+            assert!(text.starts_with(truncate_on_char_boundary(text, max)));
+        }
     }
 
     #[test]

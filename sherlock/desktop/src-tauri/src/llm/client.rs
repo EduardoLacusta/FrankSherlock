@@ -174,6 +174,9 @@ pub fn ollama_generate(
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_recv_body(Some(Duration::from_secs(timeout_secs)))
         .timeout_send_body(Some(Duration::from_secs(30)))
+        // Hard ceiling for the whole call: a request that never gets a
+        // response must not park the scan thread forever.
+        .timeout_global(Some(Duration::from_secs(timeout_secs + 120)))
         // Read error bodies too, so Ollama's message ends up in the logs.
         .http_status_as_error(false)
         .build()
